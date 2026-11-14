@@ -1,0 +1,188 @@
+name: OpenTofu CI (AWS Emulator)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Stage 1: Static Validation & Security Scanning
+  # ----------------------------------------------------------------------------
+  validate:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "~1.11.0"
+
+      - name: Configure OpenTofu plugin cache directory
+        run: |
+          CACHE_DIR="${RUNNER_TEMP}/terraform-plugin-cache"
+          mkdir -p "$CACHE_DIR"
+          echo "TF_PLUGIN_CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
+
+      - name: Cache OpenTofu providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/terraform-plugin-cache
+          key: ${{ runner.os }}-tofu-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+      - name: OpenTofu Format Check
+        run: tofu fmt -check -recursive
+
+      - name: OpenTofu Init (backend disabled)
+        run: tofu init -backend=false
+
+      - name: OpenTofu Validate
+        run: tofu validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+      - name: Run Trivy Security Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          exit-code: "0"
+
+  # ----------------------------------------------------------------------------
+  # Stage 2: Integration Test against AWS Emulator (Latest Release)
+  # ----------------------------------------------------------------------------
+  test-aws-emulator:
+    name: Integration Test (AWS Emulator)
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      EMULATOR_PORT: "9297"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "~1.11.0"
+
+      - name: Configure OpenTofu plugin cache directory
+        run: |
+          CACHE_DIR="${RUNNER_TEMP}/terraform-plugin-cache"
+          mkdir -p "$CACHE_DIR"
+          echo "TF_PLUGIN_CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
+
+      - name: Cache OpenTofu providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/terraform-plugin-cache
+          key: ${{ runner.os }}-tofu-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+      - name: Install AWS Emulator (LTS/latest)
+        run: |
+          deb="$(mktemp -d)/aws-emulator.deb"
+          curl -fsSLo "$deb" https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+          sudo apt-get update -y
+          sudo apt-get install -y "$deb"
+          echo "/opt/aws-emulator/bin" >> "$GITHUB_PATH"
+          /opt/aws-emulator/bin/aws-emulator -v
+
+      - name: Start AWS Emulator (Telemetry Off)
+        run: |
+          mkdir -p "$HOME/.aws/emulator/$EMULATOR_PORT"
+          nohup /opt/aws-emulator/bin/aws-emulator \
+            -p "$EMULATOR_PORT" \
+            -t off \
+            --idle-timeout 900 \
+            > "$HOME/.aws/emulator/${EMULATOR_PORT}.log" 2>&1 &
+
+          for i in $(seq 30); do
+            if [ -f "$HOME/.aws/emulator/$EMULATOR_PORT/ca.pem" ] && \
+               curl -sf --cacert "$HOME/.aws/emulator/$EMULATOR_PORT/ca.pem" "https://127.0.0.1:${EMULATOR_PORT}/__admin/health" >/dev/null; then
+              echo "AWS Emulator is healthy on port $EMULATOR_PORT"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "AWS Emulator failed to become healthy within 30s" >&2
+              cat "$HOME/.aws/emulator/${EMULATOR_PORT}.log" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Write Emulator Connection Environment File
+        run: |
+          cat > "$HOME/.aws/emulator/${EMULATOR_PORT}.env" <<EOF
+          export AWS_ENDPOINT_URL=https://127.0.0.1:${EMULATOR_PORT}
+          export AWS_SHARED_CREDENTIALS_FILE=\$HOME/.aws/emulator/${EMULATOR_PORT}/emulator_credentials
+          export AWS_CONFIG_FILE=\$HOME/.aws/emulator/${EMULATOR_PORT}/config
+          export AWS_EC2_METADATA_DISABLED=true
+          export AWS_REGION=us-east-1
+          export AWS_DEFAULT_REGION=us-east-1
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE \
+            AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+            AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_AUTHORIZATION_TOKEN
+          export AWS_CA_BUNDLE=\$HOME/.aws/emulator/${EMULATOR_PORT}/ca.pem
+          export AWS_PAGER=""
+          EOF
+
+      - name: Verify Emulator Identity (Account 000000000000)
+        run: |
+          (
+            set -euo pipefail
+            . "$HOME/.aws/emulator/${EMULATOR_PORT}.env"
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            echo "Connected to Account: $ACCOUNT_ID"
+            if [ "$ACCOUNT_ID" != "000000000000" ]; then
+              echo "ERROR: Expected emulator account 000000000000, got $ACCOUNT_ID" >&2
+              exit 1
+            fi
+          )
+
+      - name: OpenTofu Init, Plan, Apply, and Verify against AWS Emulator
+        run: |
+          (
+            set -euo pipefail
+            . "$HOME/.aws/emulator/${EMULATOR_PORT}.env"
+
+            tofu init -input=false
+            tofu test
+            tofu plan -input=false -out=tfplan
+            tofu apply -input=false tfplan
+
+            # Verify provisioned infrastructure via AWS CLI against the emulator
+            CLUSTER_NAME=$(tofu output -raw ecs_cluster_name)
+            SERVICE_NAME=$(tofu output -raw ecs_service_name)
+            ALB_ARN=$(tofu output -raw alb_arn)
+            TG_ARN=$(tofu output -raw alb_target_group_arn)
+
+            aws ecs describe-clusters --clusters "$CLUSTER_NAME" --query 'clusters[0].status' --output text | grep -qx "ACTIVE"
+            aws ecs describe-services --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" --query 'services[0].status' --output text | grep -qx "ACTIVE"
+            aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --query 'LoadBalancers[0].Type' --output text | grep -qx "application"
+            aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" --query 'TargetGroups[0].TargetType' --output text | grep -qx "ip"
+
+            # Preview and execute clean teardown
+            tofu plan -destroy -input=false -out=tfplan.destroy
+            tofu apply -input=false tfplan.destroy
+          )
+
+      - name: Stop AWS Emulator
+        if: always()
+        run: |
+          pkill -TERM -f "aws-emulator -p ${EMULATOR_PORT}" || true
